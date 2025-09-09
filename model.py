@@ -8,34 +8,10 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import torch
 import os
-import numpy as np
-import pandas as pd
-import json,pickle
-import networkx as nx
-from math import sqrt
-from random import shuffle
-from collections import OrderedDict
-from scipy import stats
-from IPython.display import SVG
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn import Sequential, Linear, ReLU
-from torch.utils.data import Dataset
-from sklearn.model_selection import train_test_split
-from typing import Dict, List, Union
-from pathlib import Path
-from rdkit import Chem
-from rdkit.Chem.Draw import IPythonConsole
-from rdkit.Chem import rdDepictor
-from rdkit.Chem.Draw import rdMolDraw2D
-from rdkit.Chem import MolFromSmiles
-from torch_geometric.data import Data, Batch # 주로 상수를 이렇게 대문자 온리로 표현
-from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GCNConv, global_max_pool as gmp
-from torch_geometric.nn import global_mean_pool as gap, global_max_pool as gmp
-from sklearn.metrics import mean_squared_error
-from scipy.stats import pearsonr, spearmanr
+from torch_geometric.nn import GCNConv
+from torch_geometric.utils import dense_to_sparse
 
 # 시각화 라이브러리
 from matplotlib import pyplot as plt
@@ -43,267 +19,147 @@ import seaborn as sns
 # %matplotlib inline
 print('executed')
 
-# 약물 인코딩
-def feature_encoding(x, allowable_set):
-    if x not in allowable_set:
-        raise Exception("input{0} not allowed in set {1}:".format(x, allowable_set))
-    return list(map(lambda s: x == s, allowable_set))
-def feature_encoding_unk(x, allowable_set):
-    # allowable set에 있지 않으면 마지막 요소로 매핑
-    if x not in allowable_set:
-        x = allowable_set[-1]
-    return list(map(lambda s: x == s, allowable_set))
-def atom_features(atom):
-    return np.array(feature_encoding_unk(atom.GetSymbol(),['C', 'N', 'O', 'S', 'F', 'Si', 'P', 'Cl', 'Br', 'Mg', 'Na','Ca', 'Fe', 'As', 'Al', 'I', 'B', 'V', 'K', 'Tl', 'Yb','Sb', 'Sn', 'Ag', 'Pd', 'Co', 'Se', 'Ti', 'Zn', 'H','Li', 'Ge', 'Cu', 'Au', 'Ni', 'Cd', 'In', 'Mn', 'Zr','Cr', 'Pt', 'Hg', 'Pb', 'Unknown']) +
-                    feature_encoding(atom.GetDegree(), [0,1,2,3,4,5,6,7,8,9,10]) +
-                    feature_encoding_unk(atom.GetTotalNumHs(),[0,1,2,3,4,5,6,7,8,9,10]) +
-                    feature_encoding_unk(atom.GetImplicitValence(),[0,1,2,3,4,5,6,7,8,9,10]) +
-                    [atom.GetIsAromatic()] # 이거 하나하나 어떻게 나오는건지 다음에 공부해보기
-                    )
 
-# returns: 원자 개수, 원자 특성 행렬, 인접 행렬
-def smiles_to_graph(smiles):
-    # 문자열 -> 그래프
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError(f"Invalid SMILES: {smiles}")
+class PoolingLayer(nn.Module): # mean pooling
+    """
+    Create a pooling layer to average node-level properties into graph-level properties
+    """
 
-    # 원자 개수 저장
-    c_size = mol.GetNumAtoms()
-    features = []
-
-    for atom in mol.GetAtoms():
-        feature = atom_features(atom)
-        features.append(feature/sum(feature)) # 정규화 - feature들이 모두 숫자로 표현될 수 있는건가?
-
-    # 엣지 - 시작 원자 정보와 끝 원자 정보
-    edges = []
-    for bond in mol.GetBonds():
-        edges.append([bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()])
-
-    # nx라이브러리를 이용해 데이터를 방향 그래프로 변환
-    g = nx.Graph(edges).to_directed()
-    edge_index = []
-    for e1, e2 in g.edges:
-        edge_index.append([e1, e2])
-
-    return c_size, features, edge_index
-
-# 단백질 임베딩
-def load_protein_embeddings(
-        pt_path: Union[str, Path],
-        protein_ids: List[str]=None,
-        dtype=torch.float32):
-    obj = torch.load(pt_path, map_location='cpu')
-
-     # case A: 이미 dict 형식
-    if isinstance(obj, dict):
-        # 텐서형 값만 dtype 맞춰 통일
-        out = {}
-        for k, v in obj.items():
-            tv = torch.as_tensor(v, dtype=dtype)
-            if tv.dim() == 2 and tv.size(0) == 1:  # [1, D]로 저장된 경우
-                tv = tv.squeeze(0) # 여기서 형태 한번 확인하기/변수들
-            out[k] = tv
-        return out
-class FFBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, dropout = 0.2):
+    def __init__(self):
+        # Call constructor of base class
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-    def forward(self, x):
-        return self.net(x)
+
+    def forward(self, node_fea):
+        # Pool the node matrix
+        pooled_node_fea = node_fea.mean(dim=1)
+        return pooled_node_fea
+
 # GCN 모델 구현
 class GCN(torch.nn.Module):
-    def __init__(self, n_output = 1, n_filters=32, embed_dim=128, num_features_xd=78, num_features_xt = 25, output_dim=128, dropout=0.2, esm_in_dim=1280):
-        super(GCN, self).__init__()
-        self.n_output = n_output # 모델의 출력은 숫자 1개
+    def __init__(
+        self,
+        node_vec_len: int,
+        node_fea_len: int,
+        hidden_fea_len: int,
+        n_conv: int,
+        n_hidden: int,
+        n_outputs: int,
+        p_dropout: float = 0.0,
+    ):
+        super().__init__()
+        # self.conv1 = GCNConv(num_features_xd, 128) # 보통 2의 제곱수로 맞춤
+                # Define layers
+        # Initial transformation from node matrix to node features
+        self.init_transform = nn.Linear(node_vec_len, node_fea_len)
 
-        # Drug Representation
-        self.conv1 = GCNConv(num_features_xd, 128) # 보통 2의 제곱수로 맞춤
-        self.conv2 = GCNConv(128, 256) # hidden 128 -> 256 ~~
-        # self.conv3 = GCNConv(num_features_xd*2, num_features_xd*4) # 2개 레이어면 충분
+        # Convolution layers
+        self.conv_layers = nn.ModuleList()
+        in_dim = node_fea_len
+        sizes = [in_dim, 128]
+        for i in range(n_conv):
+                self.conv_layers.append(GCNConv(sizes[i], sizes[i+1]))
+                sizes.append(sizes[i+1]*2)
+        final_gcn_dim = sizes[-2]
 
-        # fully connected layer - 1024차원으로 변환
-        self.fc_g1 = torch.nn.Linear(256, 1024)
-        self.fc_g2 = torch.nn.Linear(1024, output_dim)
+        # Pool convolution outputs
+        self.pooling = PoolingLayer()
+        pooled_node_fea_len = final_gcn_dim
 
-        # activation function
-        self.relu = nn.ReLU()
-        #Dropout
-        self.dropout = nn.Dropout(dropout)
+        # Pooling activation
+        self.pooling_activation = nn.LeakyReLU()
 
-        self.out = nn.Linear(512, self.n_output)
-    def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
-        # target = data.target
+        # From pooled vector to hidden layers
+        self.pooled_to_hidden = nn.Linear(pooled_node_fea_len, hidden_fea_len)
 
-        # GCN Layer
-        x = self.conv1(x, edge_index)
-        x = self.relu(x)
+        # Hidden layer
+        self.hidden_layer = nn.Linear(hidden_fea_len, hidden_fea_len)
+
+        # Hidden layer activation function
+        self.hidden_activation = nn.LeakyReLU()
+
+        # Hidden layer dropout
+        self.dropout = nn.Dropout(p=p_dropout)
+
+        # If hidden layers more than 1, add more hidden layers
+        self.n_hidden = n_hidden
+        if self.n_hidden > 1:
+            self.hidden_layers = nn.ModuleList(
+                [self.hidden_layer for _ in range(n_hidden - 1)]
+            )
+            self.hidden_activation_layers = nn.ModuleList(
+                [self.hidden_activation for _ in range(n_hidden - 1)]
+            )
+            self.hidden_dropout_layers = nn.ModuleList(
+                [self.dropout for _ in range(n_hidden - 1)]
+            )
+
+        # Final layer going to the output
+        self.hidden_to_output = nn.Linear(hidden_fea_len, n_outputs)
         
-        x = self.conv2(x, edge_index)
-        x = self.relu(x)
+    def forward(self, node_mat, adj_mat):
+        # Perform initial transform on node_mat
+        # node_fea = self.init_transform(node_mat)
 
-        x = self.conv3(x, edge_index)
-        x = self.relu(x)
-        # conv, relu, dropout을 하나의 블록으로 묶기 -> 나중에 추가되면 다시 반복 안해도 되도록
+        # Perform convolutions
+        # for conv in self.conv_layers:
+        #     node_fea = conv(node_fea, adj_mat)
+        # x = node_mat.squeeze(0)     # (N,F)
+        # adj = adj_mat.squeeze(0)    # (N,N)
+        B, N, F = node_mat.shape
+        x = self.init_transform(node_mat.reshape(B*N, F))  # (B*N, F')
+        edge_index, edge_weight = dense_to_sparse(adj_mat)
+        edge_index = edge_index.to(x.device).long()
 
-        x = gmp(x, batch)
+        # x = self.init_transform(x)
+        for conv in self.conv_layers[:-1]:
+            x = conv(x, edge_index, edge_weight).relu()
+        x = self.conv_layers[-1](x, edge_index, edge_weight)
 
-        x = self.relu(self.fc_g1(x))
-        x = self.dropout(x)
-        x = self.fc_g2(x)
-        x = self.dropout(x)
 
-        # 하나의 출력값 구하기
-        xc = self.fc_g1(xc)
-        xc = self.relu(xc)
-        xc = self.dropout(xc)
-        xc = self.fc_g2(xc)
-        xc = self.relu(xc)
-        xc = self.dropout(xc)
-        out = self.out(xc)
+        # Perform pooling
+        # pooled_node_fea = self.pooling(node_fea)
+        pooled = x.mean(dim=0, keepdim=True)  # 단일 그래프 평균 풀링
+        pooled_node_fea = self.pooling_activation(pooled)
+
+        # First hidden layer
+        hidden_node_fea = self.pooled_to_hidden(pooled_node_fea)
+        hidden_node_fea = self.hidden_activation(hidden_node_fea)
+        hidden_node_fea = self.dropout(hidden_node_fea)
+
+        # Subsequent hidden layers
+        if self.n_hidden > 1:
+            for i in range(self.n_hidden - 1):
+                hidden_node_fea = self.hidden_layers[i](hidden_node_fea)
+                hidden_node_fea = self.hidden_activation_layers[i](hidden_node_fea)
+                hidden_node_fea = self.hidden_dropout_layers[i](hidden_node_fea)
+
+        # Output
+        out = self.hidden_to_output(hidden_node_fea)
+
         return out
     
-# 데이터셋 클래스
-class DrugProteinDataset(Dataset): # 원래 많이 쓰는 데이터셋 사용하기
-    def __init__(self, xd, xt, y, protein_embed_path='./cache/protein_embeds_esm2_650m_mean.pt', esm_model=None, vocab=None, strict=True):
-        assert len(xd) == len(xt) == len(y), 'xd,y의 길이는 같아야 합니다'
-        self.xd = xd
-        self.xt = xt
-        self.y = y
-        # self.smile_graph = smile_graph
-        self.esm_model = esm_model
-        self.vocab = vocab
-        self.strict = strict
+if __name__ == "__main__":
+    from graphs import Graph, ProteinEmbedding
 
-        self.protein_embed_dict = torch.load(protein_embed_path, map_location="cpu")
+    g = Graph("CC", node_vec_len=20)
+    n = torch.Tensor(g.node_mat).view(1, g.node_mat.shape[0], g.node_mat.shape[1])
+    a = torch.Tensor(g.adj_mat).view(1, g.adj_mat.shape[0], g.adj_mat.shape[1])
 
-        for k,v in self.protein_embed_dict.items():
-            if isinstance(v, torch.Tensor) and v.dtype != torch.float32:
-                self.protein_embed_dict[k] = v.float()
-        self.protein_embeds = []
-        for t in self.xt:
-            emb = self.protein_embed_dict.get(t, None)
-            self.protein_embeds.append(emb)
-    def __len__(self):
-        return len(self.xd)
-    def __getitem__(self, idx):
-        d = self.xd[idx]
-        t = self.xt[idx]
-        y = self.y[idx]
+        # 2) 단백질 임베딩 준비
+    # ProteinEmbedding.load("/ssd0/sohyun/25_DTI/cache/protein_embeds_esm2_650m_mean.pt")  # 최초 1회만
+    # prot = ProteinEmbedding("O00141","MTVKTEAAKGTLTYSRMRGMVAILIAFMKQRRMGLNDFIQKIANNSYACKHPEVQSILKISQPQEPELMNANPSPPPSPSQQINLGPSSNPHAKPSDFHFLKVIGKGSFGKVLLARHKAEEVFYAVKVLQKKAILKKKEEKHIMSERNVLLKNVKHPFLVGLHFSFQTADKLYFVLDYINGGELFYHLQRERCFLEPRARFYAAEIASALGYLHSLNIVYRDLKPENILLDSQGHIVLTDFGLCKENIEHNSTTSTFCGTPEYLAPEVLHKQPYDRTVDWWCLGAVLYEMLYGLPPFYSRNTAEMYDNILNKPLQLKPNITNSARHLLEGLLQKDRTKRLGAKDDFMEIKSHVFFSLINWDDLINKKITPPFNPNVSGPNDLRHFDPEFTEEPVPNSIGKSPDSVLVTASVKEAAEAFLGFSYAPPTDSFL" )  # ProteinID와 서열
+    # emb = prot.get()
+    # prot_emb = emb.unsqueeze(0)  # 배치 차원 추가 → (1, dim)
+    model = GCN(
+        node_vec_len=20,
+        node_fea_len=20,
+        hidden_fea_len=10,
+        n_conv=2,
+        n_hidden=2,
+        n_outputs=1,
+    )
 
-        c_size, features, edge_index = smiles_to_graph(d)
-        data = Data(
-            x=torch.from_numpy(np.asarray(features, dtype=np.float32)),
-            edge_index=torch.tensor(edge_index, dtype=torch.long).t().contiguous(),
-            y=torch.tensor([y], dtype=torch.float32)
-        )
-        data.c_size = torch.tensor([c_size])
-
-        # protein ESM (pooled vector)
-        data.protein = torch.tensor(self.protein_embed_dict[t], dtype=torch.float32).unsqueeze(0)  # shape: [esm_dim]
-
-        return data
-# pytorch.geometric data loader을 쓰는 경우 collate 함수가 필요 없다고 함
-
-# train/test
-def train(model, device, train_loader, optimizer, epoch):
-    print('Training on {} samples...'.format(len(train_loader.dataset)))
-    model.train()
-
-    for batch_idx, data in enumerate(train_loader):
-        data = data.to(device)
-
-        optimizer.zero_grad()
-        output = model(data)
-
-        loss = loss_fn(output, data.y.view(-1,1).float().to(device))
-
-        loss.backward()
-        optimizer.step()
-
-        if batch_idx%Log_Interval == 0:
-            print('Train epoch: {}[{}/{} ({:.0f}%)]|tLoss: {:.6f}'.format(epoch,
-                                                                          batch_idx*len(data.num_graphs),
-                                                                          len(train_loader.dataset),
-                                                                          100.*batch_idx/len(train_loader),
-                                                                          loss.item()))
-            
-def predicting(model, device, loader):
-    model.eval()
-    total_preds = []
-    total_labels = [] # torch.tensor() 해야 하나?
-
-    print('Make prediction for {} samples...'.format(len(loader.dataset)))
     with torch.no_grad():
-        for data in loader:
-            data = data.to(device)
-            output = model(data)
-            total_preds = torch.cat((total_preds, output.cpu()), 0)
-            total_labels = torch.cat((total_labels, data.y.view(-1, 1).cpu()), 0)
-    return total_labels.numpy().flatten(), total_preds.numpy().flatten()
+        out = model(n, a)
+        print(out)
 
-datasets = ['kiba']
-# model = GCN().to(device)
-cuda_name = "cuda:0"
-
-Train_Batch_Size = 512
-Test_Batch_Size = 512
-LR = 0.0005
-Log_Interval = 20
-Num_Epochs = 10
-
-train_d = pd.read_csv('./data/kiba_train.csv')
-test_d = pd.read_csv('./data/kiba_test.csv')
-
-#     def __init__(self, xd, xt, y, smile_graph, protein_embed_path='protein_embeds_esm2_650m_mean.pt', esm_model=None, vocab=None, strict=True):
-
-train_data = DrugProteinDataset(train_d['X1'], train_d['ID2'], train_d['Y'])
-test_data = DrugProteinDataset(test_d['X1'], test_d['ID2'], test_d['Y'])
-
-train_loader = DataLoader(train_data, batch_size=Train_Batch_Size, shuffle=True)
-test_loader = DataLoader(test_data, batch_size=Test_Batch_Size, shuffle=False)
-
-device = torch.device(cuda_name if torch.cuda.is_available() else 'cpu')
-model = GCN(n_output=1, # 모델 하나 더 정의해야 함(GCN포함) + (ESM) + prediction layer 
-    embed_dim=128,
-    output_dim=128,
-    dropout=0.2,
-    # ESM2-650M mean 차원은 1280인 경우가 일반적
-    esm_in_dim=1280).to(device) # 하이퍼파라미터 전달
-
-loss_fn = nn.MSELoss()
-
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-
-best_mse = 1000
-best_ci = 0
-best_epoch = -1
-
-model_file_name = 'model_GCN_kiba.model'
-result_file_name = 'result_GCN_kiba.csv'
-
-for epoch in range(Num_Epochs):
-    train(model, device, train_loader, optimizer, epoch + 1)
-
-    G, P = predicting(model, device, test_loader)
-
-    rmse = mean_squared_error(G, P, squared=False)
-    mse_ = mean_squared_error(G, P)
-    pear = float(pearsonr(G, P)[0]) if len(G) > 1 else 0.0
-    spear = float(spearmanr(G, P)[0]) if len(G) > 1 else 0.0
-
-    if mse_ < best_mse:
-        best_mse = mse_
-        best_epoch = epoch + 1
-        torch.save(model.state_dict(), model_file_name)
-        with open(result_file_name, "w") as f:
-            f.write(f"{rmse},{mse_},{pear},{spear}")
-        print(f"[Epoch {epoch+1}] Improved: rmse={rmse:.6f}, mse={mse_:.6f}, r={pear:.4f}, ρ={spear:.4f}")
-    else:
-        print(f"[Epoch {epoch+1}] No improvement (best mse={best_mse:.6f} @ epoch {best_epoch})")
